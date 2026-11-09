@@ -12,6 +12,10 @@ Which stream is the presentation is chosen automatically (SCREEN tag, else the
 stream that compresses best = static slides). Check with --list, override with
 --screen N.
 
+Offline use: --download-only fetches everything into <out>\\_raw now;
+--encode-only encodes it later without internet. A normal run does both at
+once, with downloads never waiting for the encoder.
+
 Already-downloaded lectures are skipped (tracked in <out>\\.downloaded.txt).
 Lectures are pipelined: the next one downloads while the current one encodes.
 
@@ -28,6 +32,7 @@ Requirements (one-time):
 
 import argparse
 import copy
+import json
 import queue
 import re
 import shutil
@@ -248,8 +253,28 @@ def session_id(url):
     return m.group(1).lower() if m else url
 
 
-def download_lecture(url, label, cookie_file, args):
-    """Download the presentation + camera streams of one lecture into a temp folder."""
+def load_raw(raw_dir, label=""):
+    """A fully downloaded lecture from its raw folder, or None if incomplete."""
+    meta_file = raw_dir / "meta.json"
+    if not meta_file.exists():
+        return None
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    camera = raw_dir / meta["camera"] if meta["camera"] else None
+    return Job(meta["url"], label, meta["title"], raw_dir / meta["screen"], camera, raw_dir)
+
+
+def download_lecture(url, label, cookie_file, args, raw_root):
+    """
+    Download the presentation + camera of one lecture into raw_root/<id>/.
+    The folder persists: an interrupted download resumes on the next run,
+    and a finished one can be encoded later, even offline (--encode-only).
+    meta.json is written last, so its presence means 'download complete'.
+    """
+    raw_dir = raw_root / session_id(url)
+    if (job := load_raw(raw_dir, label)) is not None:
+        tqdm.write(f"{label} already downloaded: {job.title}")
+        return job
+
     info = fetch_info(url, cookie_file)
     title = info.get("title") or "lecture"
     streams = list_streams(info)
@@ -273,25 +298,25 @@ def download_lecture(url, label, cookie_file, args):
                + (f", camera={camera.tag} {camera_fmt.get('height')}p" if camera else "")
                + (f" (ignoring {skipped} other stream(s); see --list)" if skipped else ""))
 
-    workdir = Path(tempfile.mkdtemp(prefix="panopto_"))
-    try:
-        screen_file = download_stream(info, screen, screen_fmt, cookie_file, workdir / "screen", label)
-        camera_file = (download_stream(info, camera, camera_fmt, cookie_file, workdir / "camera", label)
-                       if camera else None)
-    except BaseException:
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    screen_file = download_stream(info, screen, screen_fmt, cookie_file, raw_dir / "screen", label)
+    camera_file = (download_stream(info, camera, camera_fmt, cookie_file, raw_dir / "camera", label)
+                   if camera else None)
+    (raw_dir / "meta.json").write_text(json.dumps({
+        "url": url, "title": title, "layout": args.layout,
+        "screen": screen_file.name, "camera": camera_file.name if camera_file else None,
+    }, ensure_ascii=False), encoding="utf-8")
     tqdm.write(f"{label} downloaded: {title}")
-    return Job(url, label, title, screen_file, camera_file, workdir)
+    return Job(url, label, title, screen_file, camera_file, raw_dir)
 
 
 def encode_lecture(job, out_dir, args):
     """Combine a downloaded lecture and move the result to out_dir."""
     final_path = out_dir / f"{safe_filename(job.title)}.mp4"
+    local_out = job.workdir / "combined.mp4"
     try:
         # Encode locally first, then move: writing straight into a synced
         # Drive folder would make it upload a half-finished file.
-        local_out = job.workdir / "combined.mp4"
         combine(job.screen, job.camera, local_out, layout=args.layout, height=args.height,
                 quality=args.crf, hw=not args.cpu,
                 desc=f"{job.label} encode", position=1)
@@ -301,11 +326,14 @@ def encode_lecture(job, out_dir, args):
             drive_dir = Path(args.drive)
             drive_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(final_path, drive_dir / final_path.name)
-    finally:
-        if args.keep:
-            tqdm.write(f"Separate streams kept in: {job.workdir}")
-        else:
-            shutil.rmtree(job.workdir, ignore_errors=True)
+    except BaseException:
+        local_out.unlink(missing_ok=True)   # raw files stay, so it can be retried
+        raise
+    # Success: the raw streams are no longer needed
+    if args.keep:
+        tqdm.write(f"Separate streams kept in: {job.workdir}")
+    else:
+        shutil.rmtree(job.workdir, ignore_errors=True)
     tqdm.write(f"{job.label} saved: {final_path}" + (" (+ copied to Drive)" if args.drive else ""))
     return final_path
 
@@ -338,9 +366,50 @@ def main():
     ap.add_argument("--screen",
                     help="Which stream is the presentation: its number from --list, "
                          "or a tag (SCREEN, OBJECT...). Default: automatic")
-    ap.add_argument("--keep", action="store_true", help="Keep the separate stream files")
-    ap.add_argument("--redo", action="store_true", help="Download again even if already done")
+    ap.add_argument("--download-only", action="store_true",
+                    help="Only download (to <out>/_raw); encode later with --encode-only")
+    ap.add_argument("--encode-only", action="store_true",
+                    help="Encode everything already in <out>/_raw - no internet needed")
+    ap.add_argument("--keep", action="store_true", help="Keep the raw stream files after encoding")
+    ap.add_argument("--redo", action="store_true", help="Process again even if already done")
     args = ap.parse_args()
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_root = out_dir / "_raw"   # downloaded, not yet encoded lectures
+    # Record of finished lectures (by id), kept next to the videos
+    done_file = out_dir / ".downloaded.txt"
+    done = set(done_file.read_text().split()) if done_file.exists() else set()
+
+    status = {}
+
+    def encode_and_record(job, key):
+        try:
+            path = encode_lecture(job, out_dir, args)
+            with open(done_file, "a") as f:
+                f.write(session_id(job.url) + "\n")
+            status[key] = f"OK -> {path.name}"
+        except Exception as e:
+            status[key] = f"FAILED (encode): {e}"
+
+    def summary(keys):
+        print("\n" + "=" * 60)
+        for k in keys:
+            print(f"{status.get(k, '?'):45.45s}  {session_id(k)}")
+        if any(s.startswith("FAILED") for s in status.values()):
+            sys.exit(1)
+
+    # ---- offline: encode whatever was downloaded earlier
+    if args.encode_only:
+        raws = [j for d_ in sorted(raw_root.glob("*")) if (j := load_raw(d_)) is not None]
+        if not raws:
+            print(f"Nothing downloaded in {raw_root}.")
+            return
+        for n, job in enumerate(raws, 1):
+            job.label = f"[{n}/{len(raws)}]"
+            encode_and_record(job, job.url)
+        summary([j.url for j in raws])
+        return
 
     urls = list(args.urls) + (read_url_file(args.file) if args.file else [])
     urls = list(dict.fromkeys(urls))   # drop duplicates, keep order
@@ -350,17 +419,15 @@ def main():
     def login(url):
         return Path(args.cookies) if args.cookies else get_cookie_file(url)
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Record of finished lectures (by id), kept next to the videos
-    done_file = out_dir / ".downloaded.txt"
-    done = set(done_file.read_text().split()) if done_file.exists() else set()
+    pending = [u for u in urls if args.redo or session_id(u) not in done]
+    # Lectures already sitting in _raw don't need the network
+    need_net = [u for u in pending if load_raw(raw_root / session_id(u)) is None]
 
-    if not args.list and not args.redo and all(session_id(u) in done for u in urls):
-        print("All lectures already downloaded - nothing to do.")
+    if not args.list and not pending:
+        print("All lectures already done - nothing to do.")
         return
 
-    cookie_file = login(urls[0])
+    cookie_file = login(urls[0]) if (args.list or need_net) else None
 
     if args.list:
         for url in urls:
@@ -375,15 +442,14 @@ def main():
                 print("  (also has PowerPoint slides as images - not downloaded)")
         return
 
-    pending = [u for u in urls if args.redo or session_id(u) not in done]
-    status = {u: "skipped (already downloaded)" for u in urls if u not in pending}
+    status.update({u: "skipped (already done)" for u in urls if u not in pending})
     total = len(pending)
 
-    # Pipeline: a background thread downloads lecture N+1 while the main
-    # thread encodes lecture N. Drive for Desktop uploads finished files
-    # in the background on its own, so all three overlap.
-    # maxsize=1 -> at most one downloaded lecture waits, which bounds disk use.
-    jobs = queue.Queue(maxsize=1)
+    # Pipeline: a background thread downloads everything as fast as it can,
+    # while the main thread encodes whatever has finished downloading.
+    # The queue is unbounded, so downloads never wait for the encoder -
+    # when you're about to lose the internet, the downloads are what matter.
+    jobs = queue.Queue()
 
     def downloader():
         nonlocal cookie_file
@@ -392,7 +458,7 @@ def main():
                 label = f"[{n}/{total}]"
                 for attempt in (1, 2):
                     try:
-                        jobs.put(download_lecture(url, label, cookie_file, args))
+                        jobs.put(download_lecture(url, label, cookie_file, args, raw_root))
                         break
                     except LoginError:
                         if attempt == 1 and not args.cookies:
@@ -409,19 +475,15 @@ def main():
     threading.Thread(target=downloader, daemon=True).start()
 
     while (job := jobs.get()) is not None:
-        try:
-            path = encode_lecture(job, out_dir, args)
-            with open(done_file, "a") as f:
-                f.write(session_id(job.url) + "\n")
-            status[job.url] = f"OK -> {path.name}"
-        except Exception as e:
-            status[job.url] = f"FAILED (encode): {e}"
+        if args.download_only:
+            status[job.url] = "downloaded (encode later: --encode-only)"
+        else:
+            encode_and_record(job, job.url)
 
-    print("\n" + "=" * 60)
-    for url in urls:
-        print(f"{status.get(url, '?'):45.45s}  {session_id(url)}")
-    if any(s.startswith("FAILED") for s in status.values()):
-        sys.exit(1)
+    if args.download_only:
+        print(f"\nAll downloads done. Encode them any time, even offline:\n"
+              f'  python panopto_dl.py --encode-only --out "{out_dir}"')
+    summary(urls)
 
 
 if __name__ == "__main__":
