@@ -8,6 +8,10 @@ Usage:
     python panopto_dl.py -f lectures.txt --drive "G:\\My Drive\\Lectures"
     python panopto_dl.py "<URL>" --list                  # only show the available streams
 
+Which stream is the presentation is chosen automatically (SCREEN tag, else the
+stream that compresses best = static slides). Check with --list, override with
+--screen N.
+
 Already-downloaded lectures are skipped (tracked in <out>\\.downloaded.txt).
 Lectures are pipelined: the next one downloads while the current one encodes.
 
@@ -48,26 +52,102 @@ def safe_filename(name):
     return re.sub(r'[<>:"/\\|?*]+', "_", name).strip()[:150] or "lecture"
 
 
-def pick_streams(info):
+@dataclass
+class Stream:
+    """One video stream of a Panopto session (best quality of it)."""
+    tag: str        # Panopto's tag: DV = primary camera, OBJECT / SCREEN = other sources
+    fmt: dict       # best-quality variant (used to classify the stream)
+    variants: list  # all quality variants of this stream, low to high
+
+    def smallest(self, min_w=0, min_h=0):
+        """
+        The cheapest variant that is still at least min_w x min_h.
+        No point downloading a 1080p camera that ends up 320px wide in a corner.
+        """
+        ok = [f for f in self.variants
+              if (f.get("width") or 0) >= min_w and (f.get("height") or 0) >= min_h]
+        return min(ok, key=lambda f: f.get("tbr") or 0) if ok else self.fmt
+
+    @property
+    def kbps_per_mpx(self):
+        """
+        Bitrate per megapixel. Slides/screen recordings are mostly static and
+        compress ~10x better than a camera filming a room, so a low value
+        means 'this is the presentation'.
+        """
+        w, h, tbr = self.fmt.get("width"), self.fmt.get("height"), self.fmt.get("tbr")
+        if not (w and h and tbr):
+            return float("inf")
+        return tbr / (w * h / 1e6)
+
+    def describe(self):
+        f = self.fmt
+        tbr = f"{f['tbr']:.0f} kbps" if f.get("tbr") else "? kbps"
+        return f"{self.tag:8s} {f.get('width')}x{f.get('height')}  {tbr:>10s}  ({self.kbps_per_mpx:.0f} kbps/MPx)"
+
+
+def list_streams(info):
     """
-    A Panopto session can contain several video streams (camera, screen...).
-    yt-dlp lists all their qualities together in info['formats']; group them
-    by stream and keep the best quality of each.
+    All separate video streams of the session.
+    Formats are grouped by their source playlist (manifest_url), NOT by tag:
+    two cameras can share the same tag, and grouping by tag would merge them.
+    The PODCAST format (Panopto's own pre-mixed version) is dropped when the
+    real streams are available.
     """
     groups = {}
     for f in info.get("formats", []):
-        if f.get("vcodec") in (None, "none"):
-            continue  # audio-only format
-        # format_note holds Panopto's stream tag (e.g. DV = camera, SCREEN...)
-        key = f.get("format_note") or "main"
-        groups.setdefault(key, []).append(f)
+        if f.get("vcodec") == "none":
+            continue  # audio-only, or the slide images ('mhtml')
+        tag = f.get("format_note") or "main"
+        source = f.get("manifest_url") or f.get("url")
+        groups.setdefault((tag, source), []).append(f)
 
-    best = []
-    for key, fmts in groups.items():
+    streams = []
+    for (tag, _), fmts in groups.items():
         # Highest resolution first, then highest bitrate
         fmts.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-        best.append((key, fmts[-1]))
-    return best
+        streams.append(Stream(tag, fmts[-1], fmts))
+
+    real = [s for s in streams if s.tag != "PODCAST"]
+    return real or streams
+
+
+def choose_streams(streams, screen_choice=None):
+    """
+    Decide which stream is the presentation (screen) and which is the camera.
+      screen_choice: None = automatic, a number = stream # from --list (1-based),
+                     or a tag such as SCREEN / OBJECT.
+    Returns (screen, camera); camera may be None.
+    """
+    if len(streams) == 1:
+        return streams[0], None
+
+    # Camera = the primary 'DV' stream (it carries the lecturer's audio)
+    dv = [s for s in streams if s.tag == "DV"]
+    camera = dv[0] if dv else streams[0]
+
+    if screen_choice:
+        if screen_choice.isdigit():
+            screen = streams[int(screen_choice) - 1]
+        else:
+            matches = [s for s in streams if s.tag.upper() == screen_choice.upper()]
+            if not matches:
+                raise RuntimeError(f"no stream tagged {screen_choice}")
+            screen = min(matches, key=lambda s: s.kbps_per_mpx)
+        if screen is camera:   # user picked the DV stream as screen: use another as camera
+            camera = next(s for s in streams if s is not screen)
+        return screen, camera
+
+    others = [s for s in streams if s is not camera]
+    tagged_screen = [s for s in others if s.tag == "SCREEN"]
+    # A SCREEN-tagged stream wins; otherwise the one that compresses best
+    screen = tagged_screen[0] if tagged_screen else min(others, key=lambda s: s.kbps_per_mpx)
+    return screen, camera
+
+
+def has_slides(info):
+    """True if the session has PowerPoint slides as images (not a video stream)."""
+    return any(f.get("format_id") == "slides" for f in info.get("formats", []))
 
 
 # ---------------------------------------------------------------- download
@@ -114,49 +194,39 @@ def fetch_info(url, cookie_file):
         raise
 
 
-def download_streams(info, cookie_file, workdir, label):
-    """Download the best version of every stream. Returns a list of files."""
-    streams = pick_streams(info)
-    if not streams:
-        raise RuntimeError("no video streams found")
-
-    files = []
-    for i, (key, f) in enumerate(streams):
-        opts = {
-            "cookiefile": str(cookie_file),
-            "format": f["format_id"],
-            "outtmpl": str(workdir / f"stream{i}_{safe_filename(key)}.%(ext)s"),
-            "concurrent_fragment_downloads": 4,   # parallel HLS segments = faster
-            "quiet": True, "noprogress": True,    # our own tqdm bar instead
-        }
+def download_stream(info, stream, fmt, cookie_file, out_base, label):
+    """Download one variant of a stream (with retries/resume). Returns the file path."""
+    opts = {
+        "cookiefile": str(cookie_file),
+        "format": fmt["format_id"],
+        "outtmpl": str(out_base) + ".%(ext)s",
+        "concurrent_fragment_downloads": 4,   # parallel HLS segments = faster
+        "quiet": True, "noprogress": True,    # our own tqdm bar instead
         # Panopto's servers sometimes stall on a fragment. Wait longer, retry
         # each fragment many times, and never silently skip one (a skipped
         # fragment = a hole in the video, and in yt-dlp it can also crash).
-        opts.update({
-            "socket_timeout": 60,
-            "retries": 10,
-            "fragment_retries": 30,
-            "file_access_retries": 10,
-            "skip_unavailable_fragments": False,
-        })
-        for attempt in range(1, 4):
-            hook = DownloadBar(f"{label} download {key} ({i + 1}/{len(streams)})", position=0)
-            opts["progress_hooks"] = [hook]
-            try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    # process_ie_result reuses the metadata we already have,
-                    # so the page isn't fetched again for every stream.
-                    # On a retry yt-dlp resumes from the fragments it already has.
-                    result = ydl.process_ie_result(copy.deepcopy(info), download=True)
-                    files.append(Path(ydl.prepare_filename(result)))
-                break
-            except (DownloadError, OSError) as e:
-                if attempt == 3:
-                    raise
-                tqdm.write(f"{label} {key}: download interrupted ({e}) - resuming, try {attempt + 1}/3")
-            finally:
-                hook.close()
-    return files
+        "socket_timeout": 60,
+        "retries": 10,
+        "fragment_retries": 30,
+        "file_access_retries": 10,
+        "skip_unavailable_fragments": False,
+    }
+    for attempt in range(1, 4):
+        hook = DownloadBar(f"{label} download {out_base.name} ({stream.tag} {fmt.get('height')}p)", position=0)
+        opts["progress_hooks"] = [hook]
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                # process_ie_result reuses the metadata we already have,
+                # so the page isn't fetched again for every stream.
+                # On a retry yt-dlp resumes from the fragments it already has.
+                result = ydl.process_ie_result(copy.deepcopy(info), download=True)
+                return Path(ydl.prepare_filename(result))
+        except (DownloadError, OSError) as e:
+            if attempt == 3:
+                raise
+            tqdm.write(f"{label} {stream.tag}: download interrupted ({e}) - resuming, try {attempt + 1}/3")
+        finally:
+            hook.close()
 
 
 # ---------------------------------------------------------------- one lecture
@@ -167,7 +237,8 @@ class Job:
     url: str
     label: str        # e.g. "[2/5]"
     title: str
-    files: list
+    screen: Path
+    camera: Path      # None if the session has a single stream
     workdir: Path
 
 
@@ -177,18 +248,41 @@ def session_id(url):
     return m.group(1).lower() if m else url
 
 
-def download_lecture(url, label, cookie_file):
-    """Download all streams of one lecture into a temp folder."""
+def download_lecture(url, label, cookie_file, args):
+    """Download the presentation + camera streams of one lecture into a temp folder."""
     info = fetch_info(url, cookie_file)
     title = info.get("title") or "lecture"
+    streams = list_streams(info)
+    if not streams:
+        raise RuntimeError("no video streams found")
+    screen, camera = choose_streams(streams, args.screen)
+
+    # Download only the quality the output actually needs
+    screen_fmt = screen.smallest(min_h=min(args.height, screen.fmt.get("height") or 0))
+    camera_fmt = None
+    if camera:
+        if args.layout == "pip":
+            # The camera ends up 1/4 of the output width
+            out_w = (screen.fmt.get("width") or 1920) * args.height / (screen.fmt.get("height") or 1080)
+            camera_fmt = camera.smallest(min_w=int(out_w / 4))
+        else:
+            camera_fmt = camera.smallest(min_h=min(args.height, camera.fmt.get("height") or 0))
+
+    skipped = len(streams) - (2 if camera else 1)
+    tqdm.write(f"{label} {title}: screen={screen.tag} {screen_fmt.get('height')}p"
+               + (f", camera={camera.tag} {camera_fmt.get('height')}p" if camera else "")
+               + (f" (ignoring {skipped} other stream(s); see --list)" if skipped else ""))
+
     workdir = Path(tempfile.mkdtemp(prefix="panopto_"))
     try:
-        files = download_streams(info, cookie_file, workdir, label)
+        screen_file = download_stream(info, screen, screen_fmt, cookie_file, workdir / "screen", label)
+        camera_file = (download_stream(info, camera, camera_fmt, cookie_file, workdir / "camera", label)
+                       if camera else None)
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
     tqdm.write(f"{label} downloaded: {title}")
-    return Job(url, label, title, files, workdir)
+    return Job(url, label, title, screen_file, camera_file, workdir)
 
 
 def encode_lecture(job, out_dir, args):
@@ -198,7 +292,7 @@ def encode_lecture(job, out_dir, args):
         # Encode locally first, then move: writing straight into a synced
         # Drive folder would make it upload a half-finished file.
         local_out = job.workdir / "combined.mp4"
-        combine(job.files, local_out, layout=args.layout, height=args.height,
+        combine(job.screen, job.camera, local_out, layout=args.layout, height=args.height,
                 quality=args.crf, hw=not args.cpu,
                 desc=f"{job.label} encode", position=1)
         shutil.move(str(local_out), final_path)
@@ -239,7 +333,11 @@ def main():
     ap.add_argument("--cpu", action="store_true",
                     help="Encode on the CPU instead of Intel Quick Sync")
     ap.add_argument("--cookies", help="Use this cookies.txt instead of logging in automatically")
-    ap.add_argument("--list", action="store_true", help="Only list streams/formats of the first URL")
+    ap.add_argument("--list", action="store_true",
+                    help="Only show the streams of each URL and which would be used")
+    ap.add_argument("--screen",
+                    help="Which stream is the presentation: its number from --list, "
+                         "or a tag (SCREEN, OBJECT...). Default: automatic")
     ap.add_argument("--keep", action="store_true", help="Keep the separate stream files")
     ap.add_argument("--redo", action="store_true", help="Download again even if already done")
     args = ap.parse_args()
@@ -265,9 +363,16 @@ def main():
     cookie_file = login(urls[0])
 
     if args.list:
-        info = fetch_info(urls[0], cookie_file)
-        with yt_dlp.YoutubeDL({"cookiefile": str(cookie_file)}) as ydl:
-            ydl.list_formats(info)
+        for url in urls:
+            info = fetch_info(url, cookie_file)
+            streams = list_streams(info)
+            screen, camera = choose_streams(streams, args.screen)
+            print(f"\n{info.get('title')}")
+            for i, s in enumerate(streams, 1):
+                role = "<- screen" if s is screen else "<- camera" if s is camera else ""
+                print(f"  {i}. {s.describe()}  {role}")
+            if has_slides(info):
+                print("  (also has PowerPoint slides as images - not downloaded)")
         return
 
     pending = [u for u in urls if args.redo or session_id(u) not in done]
@@ -287,7 +392,7 @@ def main():
                 label = f"[{n}/{total}]"
                 for attempt in (1, 2):
                     try:
-                        jobs.put(download_lecture(url, label, cookie_file))
+                        jobs.put(download_lecture(url, label, cookie_file, args))
                         break
                     except LoginError:
                         if attempt == 1 and not args.cookies:

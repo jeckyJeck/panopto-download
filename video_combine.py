@@ -4,7 +4,7 @@ using the GPU encoder when one is available.
 
 Used by panopto_dl.py:
     from video_combine import combine
-    combine(files, out_path, layout="pip", height=720, hw=True)
+    combine(screen_file, camera_file, out_path, layout="pip", height=720, hw=True)
 """
 
 import json
@@ -107,49 +107,35 @@ def _even(x):
     return int(x) // 2 * 2
 
 
-def combine(files, out_path, layout="pip", height=720, quality=26, hw=True,
+def combine(screen, camera, out_path, layout="pip", height=720, quality=26, hw=True,
             desc="Combining", position=0):
     """
-    Merge downloaded streams into one video.
+    Merge the presentation (screen) and the camera into one video.
+      screen  : main video file (presentation / board). Required.
+      camera  : file shown small in the corner, or None for screen only.
       layout  : 'pip' = camera in the bottom-right corner, 'side' = side by side
       height  : output height (720 is plenty for a phone; never upscales)
       quality : lower = better/bigger (crf-like scale for every encoder)
       hw      : use the GPU encoder (Intel Quick Sync); False = CPU
       desc, position : label and screen row of the progress bar
+    Audio comes from the camera if it has any, otherwise from the screen.
     """
     # Fixed after benchmarking on this machine: Intel Quick Sync works and
     # keeps the CPU free. hw=False forces the CPU encoder (e.g. for debugging).
     enc, enc_args, pix = ENCODER if hw else CPU_ENCODER
     enc_args = [a.replace("{q}", str(quality)) for a in enc_args]
 
-    probed = [(f, *probe(f)) for f in files]  # (file, w, h, has_audio)
+    sw, sh, s_audio = probe(screen)
+    H = _even(min(height, sh))
 
-    if len(probed) == 1:
-        f, w, h, _ = probed[0]
-        H = _even(min(height, h))
+    if camera is None:
         filt = f"[0:v]scale=-2:{H},setsar=1[v]"
-        inputs, audio_map = ["-i", str(f)], "0:a?"
+        inputs, audio_map = ["-i", str(screen)], "0:a?"
+        total = duration(screen)
     else:
-        # The camera is the stream with the lecturer's audio;
-        # if that's ambiguous, take the smaller-resolution stream.
-        # Which stream is the camera? Panopto tags its primary stream "DV"
-        # (the camera, which also carries the audio). Otherwise: the only
-        # stream with audio, or failing that the smaller one.
-        tagged = [p for p in probed if "_DV" in p[0].name]
-        with_audio = [p for p in probed if p[3]]
-        if len(tagged) == 1:
-            cam = tagged[0]
-        elif len(with_audio) == 1:
-            cam = with_audio[0]
-        else:
-            cam = min(probed, key=lambda p: p[1] * p[2])
-        main = max((p for p in probed if p is not cam), key=lambda p: p[1] * p[2])
-        if len(probed) > 2:
-            tqdm.write(f"Note: {len(probed)} streams; combining {main[0].name} + {cam[0].name} only.")
-
-        H = _even(min(height, main[2]))
+        _, _, c_audio = probe(camera)
         if layout == "pip":
-            main_w = _even(main[1] * H / main[2])
+            main_w = _even(sw * H / sh)
             cam_w = _even(main_w / 4)
             # eof_action=pass: if the camera ends early, the screen keeps playing
             filt = (f"[0:v]scale={main_w}:{H}[m];[1:v]scale={cam_w}:-2[c];"
@@ -157,8 +143,10 @@ def combine(files, out_path, layout="pip", height=720, quality=26, hw=True,
         else:
             filt = (f"[0:v]scale=-2:{H}[m];[1:v]scale=-2:{H}[c];"
                     f"[m][c]hstack=inputs=2:shortest=0,setsar=1[v]")
-        inputs = ["-i", str(main[0]), "-i", str(cam[0])]
-        audio_map = "1:a?" if cam[3] else "0:a?"
+        inputs = ["-i", str(screen), "-i", str(camera)]
+        audio_map = "1:a?" if c_audio or not s_audio else "0:a?"
+        # Output is as long as the longest input (screen keeps going if camera ends)
+        total = max(duration(screen), duration(camera))
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
            *inputs, "-filter_complex", filt,
@@ -167,6 +155,4 @@ def combine(files, out_path, layout="pip", height=720, quality=26, hw=True,
            "-c:a", "aac", "-b:a", "96k",
            "-movflags", "+faststart",   # playable before fully loaded
            str(out_path)]
-    # Output is as long as the longest input (screen keeps going if camera ends)
-    run_ffmpeg(cmd, max(duration(p[0]) for p in probed),
-               desc=f"{desc} [{enc}]", position=position)
+    run_ffmpeg(cmd, total, desc=f"{desc} [{enc}]", position=position)
